@@ -1,0 +1,361 @@
+#!/bin/zsh
+
+# Complete Google Drive OAuth & Upload Script
+# Usage: ./gdrive_upload.sh <command> [options]
+
+# Configuration file to store credentials
+CONFIG_FILE="$HOME/.gdrive_config"
+TOKEN_FILE="$HOME/.gdrive_tokens"
+
+# Store script name for usage function
+SCRIPT_NAME="$(basename "$0")"
+
+# Function to display usage
+usage() {
+    echo "Google Drive Upload Script with OAuth 2.0"
+    echo ""
+    echo "Usage:"
+    echo "  $SCRIPT_NAME setup              - Set up OAuth credentials"
+    echo "  $SCRIPT_NAME auth               - Authenticate and get tokens"
+    echo "  $SCRIPT_NAME upload <filepath>  - Upload a file"
+    echo "  $SCRIPT_NAME refresh            - Refresh access token"
+    echo ""
+    echo "Examples:"
+    echo "  $SCRIPT_NAME setup"
+    echo "  $SCRIPT_NAME auth"
+    echo "  $SCRIPT_NAME upload /path/to/file.pdf"
+    echo ""
+    echo "First-time setup:"
+    echo "  1. Run '$SCRIPT_NAME setup' to configure your OAuth credentials"
+    echo "  2. Run '$SCRIPT_NAME auth' to authenticate and get tokens"
+    echo "  3. Run '$SCRIPT_NAME upload <filepath>' to upload files"
+    exit 1
+}
+
+# Function to setup OAuth credentials
+setup_oauth() {
+    echo "=== Google Drive OAuth Setup ==="
+    echo ""
+    echo "You need to obtain OAuth 2.0 credentials from Google Cloud Console:"
+    echo "1. Go to https://console.cloud.google.com/"
+    echo "2. Create/select a project and enable Google Drive API"
+    echo "3. Go to APIs & Services > Credentials"
+    echo "4. Create OAuth client ID (Desktop application)"
+    echo "5. Download the credentials JSON or note the Client ID and Secret"
+    echo ""
+    
+    read "client_id?Enter your Client ID: "
+    read "client_secret?Enter your Client Secret: "
+    
+    if [[ -z "$client_id" || -z "$client_secret" ]]; then
+        echo "Error: Both Client ID and Client Secret are required"
+        exit 1
+    fi
+    
+    # Save credentials to config file
+    cat > "$CONFIG_FILE" << EOF
+CLIENT_ID="$client_id"
+CLIENT_SECRET="$client_secret"
+EOF
+    
+    chmod 600 "$CONFIG_FILE"
+    echo "✅ Credentials saved to $CONFIG_FILE"
+    echo ""
+    echo "Next step: Run '$SCRIPT_NAME auth' to authenticate"
+}
+
+# Function to perform OAuth authentication
+authenticate() {
+    echo "=== Google Drive Authentication ==="
+    
+    # Load credentials
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo "Error: No credentials found. Run '$SCRIPT_NAME setup' first."
+        exit 1
+    fi
+    
+    source "$CONFIG_FILE"
+    
+    # Generate authorization URL
+    local auth_url="https://accounts.google.com/o/oauth2/auth"
+    local redirect_uri="urn:ietf:wg:oauth:2.0:oob"
+    local scope="https://www.googleapis.com/auth/drive"
+    local response_type="code"
+    
+    local full_auth_url="${auth_url}?client_id=${CLIENT_ID}&redirect_uri=${redirect_uri}&scope=${scope}&response_type=${response_type}&access_type=offline"
+    
+    echo ""
+    echo "Please visit the following URL in your browser:"
+    echo ""
+    echo "$full_auth_url"
+    echo ""
+    echo "After authorization, you'll receive an authorization code."
+    
+    # Try to open URL automatically
+    if command -v open >/dev/null 2>&1; then
+        read "open_browser?Open URL automatically in browser? (y/n): "
+        if [[ "$open_browser" =~ ^[Yy]$ ]]; then
+            open "$full_auth_url"
+        fi
+    elif command -v xdg-open >/dev/null 2>&1; then
+        read "open_browser?Open URL automatically in browser? (y/n): "
+        if [[ "$open_browser" =~ ^[Yy]$ ]]; then
+            xdg-open "$full_auth_url"
+        fi
+    fi
+    
+    echo ""
+    read "auth_code?Enter the authorization code: "
+    
+    if [[ -z "$auth_code" ]]; then
+        echo "Error: Authorization code is required"
+        exit 1
+    fi
+    
+    # Exchange authorization code for tokens
+    echo "Exchanging authorization code for tokens..."
+    
+    local token_response=$(curl -s -X POST \
+        -d "client_id=$CLIENT_ID" \
+        -d "client_secret=$CLIENT_SECRET" \
+        -d "redirect_uri=$redirect_uri" \
+        -d "grant_type=authorization_code" \
+        -d "code=$auth_code" \
+        https://accounts.google.com/o/oauth2/token)
+    
+    # Parse the response using more robust regex patterns
+    local access_token=$(echo "$token_response" | sed -n 's/.*"access_token": *"\([^"]*\)".*/\1/p')
+    local refresh_token=$(echo "$token_response" | sed -n 's/.*"refresh_token": *"\([^"]*\)".*/\1/p')
+    local expires_in=$(echo "$token_response" | sed -n 's/.*"expires_in": *\([0-9]*\).*/\1/p')
+    
+    if [[ -z "$access_token" ]]; then
+        echo "❌ Authentication failed!"
+        echo "Debug - Full response:"
+        echo "$token_response"
+        echo ""
+        echo "Debug - Parsed values:"
+        echo "Access token: '$access_token'"
+        echo "Refresh token: '$refresh_token'"
+        echo "Expires in: '$expires_in'"
+        exit 1
+    fi
+    
+    # Calculate expiration time
+    local expires_at=$(($(date +%s) + expires_in))
+    
+    # Save tokens
+    cat > "$TOKEN_FILE" << EOF
+ACCESS_TOKEN="$access_token"
+REFRESH_TOKEN="$refresh_token"
+EXPIRES_AT="$expires_at"
+EOF
+    
+    chmod 600 "$TOKEN_FILE"
+    echo "✅ Authentication successful! Tokens saved."
+    echo "Access token expires in $expires_in seconds"
+    echo ""
+    echo "You can now upload files with: $SCRIPT_NAME upload <filepath>"
+}
+
+# Function to refresh access token
+refresh_token() {
+    echo "=== Refreshing Access Token ==="
+    
+    # Load credentials and tokens
+    if [[ ! -f "$CONFIG_FILE" || ! -f "$TOKEN_FILE" ]]; then
+        echo "Error: Missing credentials or tokens. Run '$SCRIPT_NAME setup' and '$SCRIPT_NAME auth' first."
+        exit 1
+    fi
+    
+    source "$CONFIG_FILE"
+    source "$TOKEN_FILE"
+    
+    if [[ -z "$REFRESH_TOKEN" ]]; then
+        echo "Error: Re-run '$SCRIPT_NAME auth' to get a new refresh token."
+        exit 1
+    fi
+    
+    # Request new access token
+    local token_response=$(curl -s -X POST \
+        -d "client_id=$CLIENT_ID" \
+        -d "client_secret=$CLIENT_SECRET" \
+        -d "refresh_token=$REFRESH_TOKEN" \
+        -d "grant_type=refresh_token" \
+        https://accounts.google.com/o/oauth2/token)
+    
+    # Parse the response using more robust regex patterns
+    local new_access_token=$(echo "$token_response" | sed -n 's/.*"access_token": *"\([^"]*\)".*/\1/p')
+    local expires_in=$(echo "$token_response" | sed -n 's/.*"expires_in": *\([0-9]*\).*/\1/p')
+    
+    if [[ -z "$new_access_token" ]]; then
+        echo "❌ Token refresh failed!"
+        echo "Response: $token_response"
+        exit 1
+    fi
+    
+    # Update tokens file
+    local expires_at=$(($(date +%s) + expires_in))
+    cat > "$TOKEN_FILE" << EOF
+ACCESS_TOKEN="$new_access_token"
+REFRESH_TOKEN="$REFRESH_TOKEN"
+EXPIRES_AT="$expires_at"
+EOF
+    
+    echo "✅ Access token refreshed successfully!"
+    echo "New token expires in $expires_in seconds"
+}
+
+# Function to check if token is expired and refresh if needed
+check_and_refresh_token() {
+    if [[ ! -f "$TOKEN_FILE" ]]; then
+        echo "Error: No tokens found. Run '$SCRIPT_NAME auth' first."
+        exit 1
+    fi
+    
+    source "$TOKEN_FILE"
+    local current_time=$(date +%s)
+    
+    # Check if token expires in the next 5 minutes (300 seconds buffer)
+    if [[ $((EXPIRES_AT - current_time)) -lt 300 ]]; then
+        echo "Access token is expired or expiring soon. Refreshing..."
+        refresh_token
+        source "$TOKEN_FILE"  # Reload updated tokens
+    fi
+}
+
+# Function to get MIME type based on file extension
+get_mime_type() {
+    local filepath="$1"
+    local extension="${filepath##*.}"
+    
+    case "${extension:l}" in
+        txt) echo "text/plain" ;;
+        pdf) echo "application/pdf" ;;
+        doc) echo "application/msword" ;;
+        docx) echo "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ;;
+        xls) echo "application/vnd.ms-excel" ;;
+        xlsx) echo "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" ;;
+        ppt) echo "application/vnd.ms-powerpoint" ;;
+        pptx) echo "application/vnd.openxmlformats-officedocument.presentationml.presentation" ;;
+        jpg|jpeg) echo "image/jpeg" ;;
+        png) echo "image/png" ;;
+        gif) echo "image/gif" ;;
+        mp4) echo "video/mp4" ;;
+        mp3) echo "audio/mpeg" ;;
+        zip) echo "application/zip" ;;
+        json) echo "application/json" ;;
+        xml) echo "application/xml" ;;
+        csv) echo "text/csv" ;;
+        html|htm) echo "text/html" ;;
+        js) echo "application/javascript" ;;
+        css) echo "text/css" ;;
+        *) echo "application/octet-stream" ;;
+    esac
+}
+
+# Function to upload file
+upload_file() {
+    local filepath="$1"
+    
+    # Check if file exists
+    if [[ ! -f "$filepath" ]]; then
+        echo "Error: File '$filepath' does not exist or is not a regular file"
+        exit 1
+    fi
+    
+    # Check and refresh token if needed
+    check_and_refresh_token
+    source "$TOKEN_FILE"
+    
+    # Get file information
+    local filename=$(basename "$filepath")
+    local filesize=$(stat -f%z "$filepath" 2>/dev/null || stat -c%s "$filepath" 2>/dev/null)
+    local mime_type=$(get_mime_type "$filepath")
+    
+    echo "=== Uploading File ==="
+    echo "File: $filename"
+    echo "Size: $filesize bytes"
+    echo "MIME type: $mime_type"
+    echo ""
+    
+    # Create metadata JSON for the file
+    local metadata="{\"name\": \"$filename\"}"
+    
+    # Create a temporary file for multipart upload
+    local temp_file=$(mktemp)
+    local boundary="----formdata-$(date +%s)"
+    
+    # Build multipart request body
+    {
+        echo "--$boundary"
+        echo "Content-Type: application/json"
+        echo ""
+        echo "$metadata"
+        echo ""
+        echo "--$boundary"
+        echo "Content-Type: $mime_type"
+        echo ""
+        cat "$filepath"
+        echo ""
+        echo "--$boundary--"
+    } > "$temp_file"
+    
+    # Perform the upload using multipart
+    echo "Starting upload..."
+    local response=$(curl -s -w "\n%{http_code}" \
+        -X POST \
+        "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart" \
+        -H "Authorization: Bearer $ACCESS_TOKEN" \
+        -H "Content-Type: multipart/related; boundary=$boundary" \
+        --data-binary "@$temp_file")
+    
+    # Clean up temporary file
+    rm -f "$temp_file"
+    
+    # Parse response
+    local http_code=$(echo "$response" | tail -n1)
+    local response_body=$(echo "$response" | head -n -1)
+    
+    # Check if upload was successful
+    if [[ "$http_code" == "200" ]]; then
+        echo "✅ Upload successful!"
+        echo ""
+        echo "File details:"
+        echo "$response_body" | python3 -m json.tool 2>/dev/null || echo "$response_body"
+        
+        # Extract file ID and create shareable link
+        local file_id=$(echo "$response_body" | sed -n 's/.*"id": *"\([^"]*\)".*/\1/p')
+        if [[ -n "$file_id" ]]; then
+            echo ""
+            echo "🔗 Direct link: https://drive.google.com/file/d/$file_id/view"
+        fi
+    else
+        echo "❌ Upload failed with HTTP status code: $http_code"
+        echo "Response:"
+        echo "$response_body"
+        exit 1
+    fi
+}
+
+# Main script logic
+case "$1" in
+    "setup")
+        setup_oauth
+        ;;
+    "auth")
+        authenticate
+        ;;
+    "refresh")
+        refresh_token
+        ;;
+    "upload")
+        if [[ -z "$2" ]]; then
+            echo "Error: No filepath provided for upload"
+            usage
+        fi
+        upload_file "$2"
+        ;;
+    *)
+        usage
+        ;;
+esac
