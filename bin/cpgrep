@@ -4,7 +4,7 @@ if [[ -z "$1" ]]; then
     echo "Usage: cherry_pick_grep <grep_pattern> [branch]"
     echo "Example: cherry_pick_grep TASK-1"
     echo "Example: cherry_pick_grep TASK-1 origin/main"
-    return 1
+    exit 1
 fi
 
 local pattern="$1"
@@ -16,7 +16,7 @@ local commits
 if [[ -n "$branch" ]]; then
     commits=($(git log --oneline "$branch" | grep "$pattern" | awk '{print $1}' | tac))
 else
-    commits=($(glo | grep "$pattern" | awk '{print $1}' | tac))
+    commits=($(git log --oneline | grep "$pattern" | awk '{print $1}' | tac))
 fi
 
 if [[ ${#commits[@]} -eq 0 ]]; then
@@ -24,7 +24,7 @@ if [[ ${#commits[@]} -eq 0 ]]; then
     if [[ -n "$branch" ]]; then
         echo "Searched in branch: $branch"
     fi
-    return 1
+    exit 1
 fi
 
 echo "Found ${#commits[@]} commits matching '$pattern'"
@@ -42,7 +42,7 @@ read "confirm?Proceed with cherry-picking these commits? (y/N): "
 
 if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
     echo "Cherry-pick cancelled."
-    return 0
+    exit 0
 fi
 
 echo "Cherry-picking commits in chronological order..."
@@ -52,7 +52,7 @@ if ! git cherry-pick "${commits[@]}"; then
     echo "Cherry-pick failed. Resolve conflicts and run:"
     echo "  git cherry-pick --continue  (to continue)"
     echo "  git cherry-pick --abort     (to cancel)"
-    return 1
+    exit 1
 fi
 
 echo "Successfully cherry-picked all commits!"
