@@ -1,0 +1,58 @@
+#!/bin/zsh
+
+if [[ -z "$1" ]]; then
+    echo "Usage: cherry_pick_grep <grep_pattern> [branch]"
+    echo "Example: cherry_pick_grep TASK-1"
+    echo "Example: cherry_pick_grep TASK-1 origin/main"
+    return 1
+fi
+
+local pattern="$1"
+local branch="${2:-}"
+
+# Get commit hashes matching the pattern, sorted from earliest to latest
+# glo shows latest first, so we reverse with tac to get earliest first
+local commits
+if [[ -n "$branch" ]]; then
+    commits=($(git log --oneline "$branch" | grep "$pattern" | awk '{print $1}' | tac))
+else
+    commits=($(glo | grep "$pattern" | awk '{print $1}' | tac))
+fi
+
+if [[ ${#commits[@]} -eq 0 ]]; then
+    echo "No commits found matching pattern: $pattern"
+    if [[ -n "$branch" ]]; then
+        echo "Searched in branch: $branch"
+    fi
+    return 1
+fi
+
+echo "Found ${#commits[@]} commits matching '$pattern'"
+if [[ -n "$branch" ]]; then
+    echo "in branch '$branch':"
+else
+    echo ":"
+fi
+for commit in "${commits[@]}"; do
+    echo "  $(git log --oneline -1 $commit)"
+done
+
+echo
+read "confirm?Proceed with cherry-picking these commits? (y/N): "
+
+if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+    echo "Cherry-pick cancelled."
+    return 0
+fi
+
+echo "Cherry-picking commits in chronological order..."
+echo "Running: git cherry-pick ${commits[*]}"
+
+if ! git cherry-pick "${commits[@]}"; then
+    echo "Cherry-pick failed. Resolve conflicts and run:"
+    echo "  git cherry-pick --continue  (to continue)"
+    echo "  git cherry-pick --abort     (to cancel)"
+    return 1
+fi
+
+echo "Successfully cherry-picked all commits!"

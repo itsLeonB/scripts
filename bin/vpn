@@ -1,0 +1,337 @@
+#!/bin/bash
+
+# OpenFortiVPN Management Script
+# Usage: vpn <command>
+#
+# Commands:
+#   connect, c    - Connect to VPN (prompts for OTP)
+#   kill, k       - Disconnect VPN
+#   help, h       - Show help
+
+# Configuration file path
+CONFIG_FILE="$HOME/.scripts-data/openforti.cfg"
+
+# Function to show help
+show_help() {
+    echo "OpenFortiVPN Management"
+    echo "======================"
+    echo ""
+    echo "Usage: vpn <command>"
+    echo ""
+    echo "Commands:"
+    echo "  connect, c      Connect to VPN (prompts for OTP code)"
+    echo "  kill, k         Disconnect VPN"
+    echo "  configure, cfg  Create/edit configuration file"
+    echo "  help, h         Show this help"
+    echo ""
+    echo "Configuration file: $CONFIG_FILE"
+    echo ""
+    echo "Examples:"
+    echo "  vpn connect      # Connect to VPN (will prompt for OTP)"
+    echo "  vpn c            # Same as above (short form)"
+    echo "  vpn kill         # Disconnect VPN"
+    echo "  vpn k            # Same as above (short form)"
+    echo "  vpn configure    # Create/edit configuration file"
+    echo "  vpn cfg          # Same as above (short form)"
+    echo ""
+    echo "Note: This script requires sudo privileges"
+}
+
+# Function to connect to VPN
+vpn_connect() {
+    echo "OpenFortiVPN Connection"
+    echo "======================"
+
+    # Ensure sudo privileges first
+    echo "Requesting sudo privileges..."
+    if ! sudo true; then
+        echo "Error: Failed to obtain sudo privileges"
+        exit 1
+    fi
+
+    echo "Config: $CONFIG_FILE"
+    echo ""
+
+    # Check if configuration file exists
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo "Error: Configuration file not found at $CONFIG_FILE"
+        echo "Please create the OpenFortiVPN configuration file first."
+        echo "See: $HOME/.scripts-data/openforti.cfg.example for template"
+        exit 1
+    fi
+
+    # Check if openfortivpn is installed
+    if ! command -v openfortivpn &>/dev/null; then
+        echo "Error: openfortivpn is not installed or not in PATH"
+        echo "Install with: sudo apt install openfortivpn (Ubuntu) or brew install openfortivpn (macOS)"
+        exit 1
+    fi
+
+    # Check if VPN is already running
+    if pgrep -x "openfortivpn" >/dev/null; then
+        echo "Warning: OpenFortiVPN is already running"
+        echo "Use 'vpn kill' to disconnect first"
+        exit 1
+    fi
+
+    # Prompt for OTP code
+    echo -n "Enter OTP code: "
+    read -r OTP_CODE
+
+    # Validate OTP code (basic check - should be numeric and reasonable length)
+    if [[ -z "$OTP_CODE" ]]; then
+        echo "Error: OTP code cannot be empty"
+        exit 1
+    fi
+
+    if ! [[ "$OTP_CODE" =~ ^[0-9]{4,8}$ ]]; then
+        echo "Warning: OTP code should be 4-8 digits. Proceeding anyway..."
+    fi
+
+    echo ""
+    echo "OTP: $OTP_CODE"
+
+    echo "Starting OpenFortiVPN connection..."
+    echo "Press Ctrl+C within the next few seconds to cancel"
+    sleep 2
+
+    # Start OpenFortiVPN in background with disown
+    sudo openfortivpn --config="$CONFIG_FILE" --otp="$OTP_CODE" &
+    VPNPID=$!
+
+    # Disown the process so it continues after script exits
+    disown
+
+    echo ""
+    echo "OpenFortiVPN started in background (PID: $VPNPID)"
+    echo "Use 'vpn kill' to disconnect"
+    echo ""
+    echo "To check connection status:"
+    echo "  ps aux | grep openfortivpn"
+    echo "  ip route | grep ppp"
+}
+
+# Function to configure VPN
+vpn_configure() {
+    echo "OpenFortiVPN Configuration"
+    echo "=========================="
+    echo "Config file: $CONFIG_FILE"
+    echo ""
+
+    # Create .scripts-data directory if it doesn't exist
+    mkdir -p "$(dirname "$CONFIG_FILE")"
+
+    # Check if config file already exists
+    if [[ -f "$CONFIG_FILE" ]]; then
+        echo "Configuration file already exists."
+        echo "Current contents:"
+        echo "=================="
+        cat "$CONFIG_FILE"
+        echo "=================="
+        echo ""
+        echo -n "Do you want to edit the existing file? (y/N): "
+        read -r response
+        if [[ ! "$response" =~ ^[Yy]$ ]]; then
+            echo "Configuration unchanged."
+            return 0
+        fi
+    else
+        echo "Creating new configuration file..."
+    fi
+
+    echo ""
+    echo "Please provide the following information:"
+    echo "(Press Enter to keep existing value or leave blank)"
+    echo ""
+
+    # Read current values if file exists
+    local current_host=""
+    local current_port=""
+    local current_username=""
+    local current_password=""
+    local current_realm=""
+    local current_trusted_cert=""
+
+    if [[ -f "$CONFIG_FILE" ]]; then
+        current_host=$(grep "^host = " "$CONFIG_FILE" 2>/dev/null | cut -d' ' -f3- || echo "")
+        current_port=$(grep "^port = " "$CONFIG_FILE" 2>/dev/null | cut -d' ' -f3- || echo "")
+        current_username=$(grep "^username = " "$CONFIG_FILE" 2>/dev/null | cut -d' ' -f3- || echo "")
+        current_password=$(grep "^password = " "$CONFIG_FILE" 2>/dev/null | cut -d' ' -f3- || echo "")
+        current_realm=$(grep "^realm = " "$CONFIG_FILE" 2>/dev/null | cut -d' ' -f3- || echo "")
+        current_trusted_cert=$(grep "^trusted-cert = " "$CONFIG_FILE" 2>/dev/null | cut -d' ' -f3- || echo "")
+    fi
+
+    # Prompt for configuration values
+    echo -n "VPN Server Host"
+    [[ -n "$current_host" ]] && echo -n " (current: $current_host)"
+    echo -n ": "
+    read -r new_host
+    [[ -z "$new_host" && -n "$current_host" ]] && new_host="$current_host"
+
+    echo -n "VPN Server Port"
+    [[ -n "$current_port" ]] && echo -n " (current: $current_port)" || echo -n " (default: 443)"
+    echo -n ": "
+    read -r new_port
+    [[ -z "$new_port" && -n "$current_port" ]] && new_port="$current_port"
+    [[ -z "$new_port" ]] && new_port="443"
+
+    echo -n "Username"
+    [[ -n "$current_username" ]] && echo -n " (current: $current_username)"
+    echo -n ": "
+    read -r new_username
+    [[ -z "$new_username" && -n "$current_username" ]] && new_username="$current_username"
+
+    echo -n "Password"
+    if [[ -n "$current_password" ]]; then
+        echo -n " (current: [hidden], press Enter to keep current, or enter new password)"
+    else
+        echo -n " (leave blank to be prompted during connection)"
+    fi
+    echo -n ": "
+    read -s new_password
+    echo ""
+
+    # If no new password entered and we have a current password, keep it
+    if [[ -z "$new_password" && -n "$current_password" ]]; then
+        new_password="$current_password"
+    fi
+
+    echo -n "Realm (optional)"
+    [[ -n "$current_realm" ]] && echo -n " (current: $current_realm)"
+    echo -n ": "
+    read -r new_realm
+    [[ -z "$new_realm" && -n "$current_realm" ]] && new_realm="$current_realm"
+
+    echo -n "Trusted Certificate Fingerprint"
+    [[ -n "$current_trusted_cert" ]] && echo -n " (current: $current_trusted_cert)"
+    echo -n ": "
+    read -r new_trusted_cert
+    [[ -z "$new_trusted_cert" && -n "$current_trusted_cert" ]] && new_trusted_cert="$current_trusted_cert"
+
+    # Validate required fields
+    if [[ -z "$new_host" || -z "$new_username" ]]; then
+        echo ""
+        echo "Error: Host and Username are required fields"
+        exit 1
+    fi
+
+    # Create configuration file
+    echo ""
+    echo "Creating configuration file..."
+
+    cat >"$CONFIG_FILE" <<EOF
+# OpenFortiVPN Configuration File
+# Generated by vpn configure command
+
+# VPN Server
+host = $new_host
+port = $new_port
+
+# Authentication
+username = $new_username
+EOF
+
+    # Add password if provided
+    if [[ -n "$new_password" ]]; then
+        echo "password = $new_password" >>"$CONFIG_FILE"
+    else
+        echo "# password = your_password  # Uncomment and set if you don't want to be prompted" >>"$CONFIG_FILE"
+    fi
+
+    # Add realm if provided
+    if [[ -n "$new_realm" ]]; then
+        echo "" >>"$CONFIG_FILE"
+        echo "# Connection settings" >>"$CONFIG_FILE"
+        echo "realm = $new_realm" >>"$CONFIG_FILE"
+    fi
+
+    # Add trusted cert if provided
+    if [[ -n "$new_trusted_cert" ]]; then
+        [[ -z "$new_realm" ]] && echo "" >>"$CONFIG_FILE" && echo "# Connection settings" >>"$CONFIG_FILE"
+        echo "trusted-cert = $new_trusted_cert" >>"$CONFIG_FILE"
+    fi
+
+    # Add common settings
+    cat >>"$CONFIG_FILE" <<EOF
+
+# Advanced settings (uncomment as needed)
+# set-routes = 1
+# set-dns = 1
+# pppd-use-peerdns = 1
+# pppd-log = /var/log/pppd.log
+EOF
+
+    echo "Configuration file created successfully!"
+    echo ""
+    echo "Current configuration:"
+    echo "====================="
+    cat "$CONFIG_FILE"
+    echo "====================="
+    echo ""
+    echo "You can now use 'vpn connect' to establish a VPN connection."
+    echo "To edit this configuration later, run 'vpn configure' again."
+}
+
+# Function to kill VPN
+vpn_kill() {
+    echo "OpenFortiVPN Disconnect"
+    echo "======================"
+
+    # Ensure sudo privileges first
+    echo "Requesting sudo privileges..."
+    if ! sudo true; then
+        echo "Error: Failed to obtain sudo privileges"
+        exit 1
+    fi
+
+    # Check if any openfortivpn processes are running
+    if ! pgrep -x "openfortivpn" >/dev/null; then
+        echo "No OpenFortiVPN processes found running"
+        exit 0
+    fi
+
+    # Show running processes
+    echo "Found OpenFortiVPN processes:"
+    ps aux | grep -v grep | grep openfortivpn
+
+    echo ""
+    echo "Terminating OpenFortiVPN processes..."
+
+    # Kill all openfortivpn processes
+    if sudo killall openfortivpn 2>/dev/null; then
+        echo "OpenFortiVPN processes terminated successfully"
+    else
+        echo "Failed to terminate OpenFortiVPN processes or none were running"
+    fi
+
+    # Wait a moment and check if any are still running
+    sleep 2
+    if pgrep -x "openfortivpn" >/dev/null; then
+        echo "Warning: Some OpenFortiVPN processes may still be running"
+        echo "You may need to run: sudo killall -9 openfortivpn"
+    else
+        echo "All OpenFortiVPN processes stopped"
+    fi
+}
+
+# Main script logic
+case "${1:-help}" in
+connect | c)
+    vpn_connect
+    ;;
+kill | k)
+    vpn_kill
+    ;;
+configure | cfg)
+    vpn_configure
+    ;;
+help | h | --help | -h | "")
+    show_help
+    ;;
+*)
+    echo "Error: Unknown command '$1'"
+    echo ""
+    show_help
+    exit 1
+    ;;
+esac

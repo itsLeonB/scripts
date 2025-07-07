@@ -1,0 +1,480 @@
+#!/bin/zsh
+
+# Kubernetes Port Forward Manager
+# Usage: portfwd [profile]
+# 
+# Configuration file: ~/.scripts-data/portfwd.yaml
+# 
+# Example:
+#   portfwd           # Uses 'default' profile
+#   portfwd staging   # Uses 'staging' profile
+
+# Configuration file path
+CONFIG_FILE="$HOME/.scripts-data/portfwd.yaml"
+
+# Error log file
+ERROR_LOG="$HOME/.scripts-data/portfwd-errors.log"
+
+# Default profile
+PROFILE="${1:-default}"
+
+# Show help if requested
+if [[ "$1" == "-h" || "$1" == "--help" ]]; then
+    echo "Kubernetes Port Forward Manager"
+    echo ""
+    echo "Usage: portfwd [profile|--logs]"
+    echo ""
+    echo "Arguments:"
+    echo "  profile    Configuration profile to use (default: 'default')"
+    echo "  --logs     Show recent error log entries"
+    echo ""
+    echo "Configuration files (in order of preference):"
+    echo "  ~/.scripts-data/portfwd.yaml (requires yq)"
+    echo "  ~/.scripts-data/portfwd.json (requires jq)"
+    echo ""
+    echo "Error log: ~/.scripts-data/portfwd-errors.log"
+    echo ""
+    echo "The configuration file should contain profiles defining:"
+    echo "  - context: Kubernetes context (optional, uses current if empty)"
+    echo "  - namespace: Kubernetes namespace"
+    echo "  - forwards: Array of port forwarding configurations"
+    echo ""
+    echo "Example YAML configuration:"
+    echo "  default:"
+    echo "    context: \"\""
+    echo "    namespace: \"my-namespace\""
+    echo "    forwards:"
+    echo "      - name: \"api\""
+    echo "        type: \"deployment\""
+    echo "        local_port: 8080"
+    echo "        remote_port: 80"
+    echo ""
+    echo "Example JSON configuration:"
+    echo "  {"
+    echo "    \"default\": {"
+    echo "      \"context\": \"\","
+    echo "      \"namespace\": \"my-namespace\","
+    echo "      \"forwards\": ["
+    echo "        {"
+    echo "          \"name\": \"api\","
+    echo "          \"type\": \"deployment\","
+    echo "          \"local_port\": 8080,"
+    echo "          \"remote_port\": 80"
+    echo "        }"
+    echo "      ]"
+    echo "    }"
+    echo "  }"
+    exit 0
+fi
+
+# Show logs if requested
+if [[ "$1" == "--logs" ]]; then
+    if [[ -f "$ERROR_LOG" ]]; then
+        echo "Recent portfwd log entries:"
+        echo "=========================="
+        tail -20 "$ERROR_LOG"
+    else
+        echo "No log file found at $ERROR_LOG"
+    fi
+    exit 0
+fi
+
+# Global variables
+CONTEXT=""
+NAMESPACE=""
+declare -a PORT_FORWARD_CONFIGS
+
+# Function to log errors
+log_error() {
+    local message="$1"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] ERROR: $message" >> "$ERROR_LOG"
+    echo "ERROR: $message" >&2
+}
+
+# Function to log info
+log_info() {
+    local message="$1"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] INFO: $message" >> "$ERROR_LOG"
+}
+
+# Function to rotate log file if it gets too large (>1MB)
+rotate_log() {
+    if [[ -f "$ERROR_LOG" ]] && [[ $(stat -f%z "$ERROR_LOG" 2>/dev/null || stat -c%s "$ERROR_LOG" 2>/dev/null) -gt 1048576 ]]; then
+        mv "$ERROR_LOG" "${ERROR_LOG}.old"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] INFO: Log rotated" >> "$ERROR_LOG"
+    fi
+}
+
+# Arrays to store process IDs and their configurations
+declare -a PROCESS_PIDS
+declare -a PROCESS_CONFIGS
+
+# Function to parse config file (supports both YAML and JSON)
+parse_config() {
+    local profile="$1"
+    local yaml_config="$HOME/.scripts-data/portfwd.yaml"
+    local json_config="$HOME/.scripts-data/portfwd.json"
+
+    # Determine which config file to use
+    local config_file=""
+    local use_yaml=false
+
+    if [[ -f "$yaml_config" ]]; then
+        config_file="$yaml_config"
+        use_yaml=true
+    elif [[ -f "$json_config" ]]; then
+        config_file="$json_config"
+        use_yaml=false
+    else
+        log_error "No configuration file found. Expected: $yaml_config or $json_config"
+        echo "Please create a configuration file first."
+        exit 1
+    fi
+
+    echo "Using config: $config_file"
+
+    if $use_yaml; then
+        # YAML parsing with yq
+        if ! command -v yq &> /dev/null; then
+            log_error "'yq' is required for YAML parsing but not installed"
+            echo "Install with: brew install yq (macOS) or apt install yq (Ubuntu)"
+            echo "Alternatively, use JSON format: $json_config"
+            exit 1
+        fi
+
+        # Detect yq version (mikefarah/yq vs kislyuk/yq)
+        local yq_version_output=$(yq --version 2>&1)
+        local use_eval_syntax=false
+
+        if echo "$yq_version_output" | grep -q "mikefarah"; then
+            use_eval_syntax=true
+        fi
+
+        # Check if profile exists
+        local profile_check
+        if $use_eval_syntax; then
+            profile_check=$(yq eval ".${profile}" "$config_file" 2>/dev/null)
+        else
+            profile_check=$(yq -r ".${profile}" "$config_file" 2>/dev/null)
+        fi
+
+        if [[ "$profile_check" == "null" || -z "$profile_check" ]]; then
+            log_error "Profile '$profile' not found in configuration file"
+            echo "Available profiles:"
+            if $use_eval_syntax; then
+                yq eval 'keys | .[]' "$config_file" 2>/dev/null || echo "Unable to list profiles"
+            else
+                yq -r 'keys | .[]' "$config_file" 2>/dev/null || echo "Unable to list profiles"
+            fi
+            exit 1
+        fi
+
+        # Parse YAML configuration based on yq version
+        if $use_eval_syntax; then
+            # mikefarah/yq syntax
+            CONTEXT=$(yq eval ".${profile}.context" "$config_file")
+            NAMESPACE=$(yq eval ".${profile}.namespace" "$config_file")
+
+            # Parse forwards array
+            local forwards_count=$(yq eval ".${profile}.forwards | length" "$config_file")
+            PORT_FORWARD_CONFIGS=()
+
+            for ((i=0; i<forwards_count; i++)); do
+                local name=$(yq eval ".${profile}.forwards[${i}].name" "$config_file")
+                local type=$(yq eval ".${profile}.forwards[${i}].type" "$config_file")
+                local local_port=$(yq eval ".${profile}.forwards[${i}].local_port" "$config_file")
+                local remote_port=$(yq eval ".${profile}.forwards[${i}].remote_port" "$config_file")
+
+                PORT_FORWARD_CONFIGS+=("${name}:${type}:${local_port}:${remote_port}")
+            done
+        else
+            # kislyuk/yq syntax (jq-compatible)
+            CONTEXT=$(yq -r ".${profile}.context" "$config_file")
+            NAMESPACE=$(yq -r ".${profile}.namespace" "$config_file")
+
+            # Parse forwards array
+            PORT_FORWARD_CONFIGS=()
+            while IFS= read -r line; do
+                PORT_FORWARD_CONFIGS+=("$line")
+            done < <(yq -r ".${profile}.forwards[] | \"\(.name):\(.type):\(.local_port):\(.remote_port)\"" "$config_file")
+        fi
+
+        # Handle empty context
+        if [[ "$CONTEXT" == "null" || "$CONTEXT" == "" ]]; then
+            CONTEXT=""
+        fi
+    else
+        # JSON parsing with jq
+        if ! command -v jq &> /dev/null; then
+            log_error "'jq' is required for JSON parsing but not installed"
+            echo "Install with: brew install jq (macOS) or apt install jq (Ubuntu)"
+            exit 1
+        fi
+
+        # Check if profile exists
+        if ! jq -e ".${profile}" "$config_file" >/dev/null 2>&1; then
+            log_error "Profile '$profile' not found in configuration file"
+            echo "Available profiles:"
+            jq -r 'keys[]' "$config_file"
+            exit 1
+        fi
+
+        # Parse JSON configuration
+        CONTEXT=$(jq -r ".${profile}.context" "$config_file")
+        NAMESPACE=$(jq -r ".${profile}.namespace" "$config_file")
+
+        # Handle empty context
+        if [[ "$CONTEXT" == "null" || "$CONTEXT" == "" ]]; then
+            CONTEXT=""
+        fi
+
+        # Parse forwards array
+        PORT_FORWARD_CONFIGS=()
+        while IFS= read -r line; do
+            PORT_FORWARD_CONFIGS+=("$line")
+        done < <(jq -r ".${profile}.forwards[] | \"\(.name):\(.type):\(.local_port):\(.remote_port)\"" "$config_file")
+    fi
+}
+
+# Function to start a single port forward
+start_port_forward() {
+    local config="$1"
+    local name=$(echo "$config" | cut -d: -f1)
+    local type=$(echo "$config" | cut -d: -f2)
+    local local_port=$(echo "$config" | cut -d: -f3)
+    local remote_port=$(echo "$config" | cut -d: -f4)
+
+    # Check if port is already in use
+    if lsof -i :"$local_port" >/dev/null 2>&1; then
+        log_error "Port $local_port is already in use, skipping $name"
+        echo "Port $local_port is already in use, skipping $name"
+        return 1
+    fi
+
+    # Build kubectl command with optional context
+    local kubectl_cmd="kubectl"
+    if [[ -n "$CONTEXT" ]]; then
+        kubectl_cmd="$kubectl_cmd --context $CONTEXT"
+    fi
+    kubectl_cmd="$kubectl_cmd --namespace $NAMESPACE"
+
+    # Start port forward and capture stderr
+    local error_output
+    error_output=$($kubectl_cmd port-forward \
+        "${type}/${name}" \
+        "${local_port}:${remote_port}" \
+        > /dev/null 2>&1 &)
+
+    local pid=$!
+
+    # Wait briefly to check if process started successfully
+    sleep 1
+    if ! kill -0 "$pid" 2>/dev/null; then
+        log_error "Failed to start port-forwarding for $name: $error_output"
+        echo "Failed to start port-forwarding for $name"
+        return 1
+    fi
+
+    PROCESS_PIDS+=($pid)
+    PROCESS_CONFIGS+=("$config")
+
+    log_info "Started port-forwarding for $name ($type) on port $local_port->$remote_port (PID: $pid)"
+    echo "Started port-forwarding for $name ($type) on port $local_port->$remote_port (PID: $pid)"
+}
+
+# Function to start all port forwards
+start_all_port_forwards() {
+    echo "Starting port-forwarding for all services..."
+    log_info "Starting port-forwarding for all services in profile '$PROFILE'"
+    local failed=0
+    for config in "${PORT_FORWARD_CONFIGS[@]}"; do
+        if ! start_port_forward "$config"; then
+            failed=$((failed + 1))
+        fi
+        sleep 1
+    done
+
+    if [ $failed -eq ${#PORT_FORWARD_CONFIGS[@]} ]; then
+        log_error "All port-forwards failed to start. Check kubectl connection and try again."
+        echo "All port-forwards failed to start. Check kubectl connection and try again."
+        exit 1
+    fi
+
+    local success_count=$((${#PORT_FORWARD_CONFIGS[@]} - failed))
+    log_info "Port-forwards started: $success_count/${#PORT_FORWARD_CONFIGS[@]} successful"
+    echo "Port-forwards started. ($success_count/${#PORT_FORWARD_CONFIGS[@]} successful)"
+}
+
+# Function to stop all port forwards
+stop_all_port_forwards() {
+    echo "Stopping all port-forwarding processes..."
+    log_info "Stopping all port-forwarding processes"
+    for pid in "${PROCESS_PIDS[@]}"; do
+        if kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null
+        fi
+    done
+
+    # Wait a moment for graceful termination
+    sleep 2
+
+    # Force kill any remaining processes
+    for pid in "${PROCESS_PIDS[@]}"; do
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -9 "$pid" 2>/dev/null
+            log_info "Force killed process $pid"
+        fi
+    done
+
+    PROCESS_PIDS=()
+    PROCESS_CONFIGS=()
+    echo "All port-forwarding processes stopped."
+}
+
+# Signal handler for graceful shutdown
+cleanup() {
+    echo ""
+    echo "Received interrupt signal. Cleaning up..."
+    log_info "Received interrupt signal, cleaning up"
+    stop_all_port_forwards
+    exit 0
+}
+
+# Function to check and restart dead processes
+monitor_processes() {
+    local restart_needed=()
+
+    for i in {1..${#PROCESS_PIDS[@]}}; do
+        local pid="${PROCESS_PIDS[$i]}"
+        local config="${PROCESS_CONFIGS[$i]}"
+
+        if ! kill -0 "$pid" 2>/dev/null; then
+            local name=$(echo "$config" | cut -d: -f1)
+            log_error "Port-forwarding for $name died (PID: $pid), attempting restart"
+            echo "Port-forwarding for $name died, restarting..."
+            restart_needed+=($i)
+        fi
+    done
+
+    # Restart dead processes
+    for index in "${restart_needed[@]}"; do
+        local config="${PROCESS_CONFIGS[$index]}"
+        if ! start_port_forward "$config"; then
+            local name=$(echo "$config" | cut -d: -f1)
+            log_error "Failed to restart port-forward for $name"
+            echo "Failed to restart port-forward for $name"
+        fi
+
+        # Update arrays (remove old entry, new one is added at the end)
+        PROCESS_PIDS[$index]=""
+        PROCESS_CONFIGS[$index]=""
+    done
+
+    # Clean up empty entries
+    PROCESS_PIDS=("${(@)PROCESS_PIDS:#}")
+    PROCESS_CONFIGS=("${(@)PROCESS_CONFIGS:#}")
+}
+
+# Function to display status
+show_status() {
+    echo ""
+    echo "Port-forwarding status:"
+    echo "======================"
+    for i in {1..${#PROCESS_PIDS[@]}}; do
+        local pid="${PROCESS_PIDS[$i]}"
+        local config="${PROCESS_CONFIGS[$i]}"
+        local name=$(echo "$config" | cut -d: -f1)
+        local type=$(echo "$config" | cut -d: -f2)
+        local local_port=$(echo "$config" | cut -d: -f3)
+        local remote_port=$(echo "$config" | cut -d: -f4)
+
+        if kill -0 "$pid" 2>/dev/null; then
+            if lsof -i :"$local_port" >/dev/null 2>&1; then
+                echo "✓ $name ($type):$local_port->$remote_port (PID: $pid)"
+            else
+                echo "! $name ($type):$local_port->$remote_port (PID: $pid, Port not listening)"
+            fi
+        else
+            echo "✗ $name ($type):$local_port->$remote_port (DEAD)"
+        fi
+    done
+    echo ""
+}
+
+# Set up signal handlers
+trap cleanup SIGINT
+
+# Main execution
+echo "Kubernetes Port Forward Manager"
+echo "=============================="
+
+# Rotate log if needed
+rotate_log
+
+# Log startup
+log_info "Starting portfwd with profile '$PROFILE'"
+
+# Parse configuration
+parse_config "$PROFILE"
+
+echo "Profile: $PROFILE"
+if [[ -n "$CONTEXT" ]]; then
+    echo "Context: $CONTEXT"
+else
+    echo "Context: (current)"
+fi
+echo "Namespace: $NAMESPACE"
+echo "Error log: $ERROR_LOG"
+echo ""
+
+# Check if kubectl is available and has valid connection
+if ! command -v kubectl &> /dev/null; then
+    log_error "kubectl is not installed or not in PATH"
+    echo "Error: kubectl is not installed or not in PATH"
+    exit 1
+fi
+
+# Build kubectl command for testing connection
+kubectl_test_cmd="kubectl"
+if [[ -n "$CONTEXT" ]]; then
+    kubectl_test_cmd="$kubectl_test_cmd --context $CONTEXT"
+fi
+
+if ! $kubectl_test_cmd get ns "$NAMESPACE" >/dev/null 2>&1; then
+    if [[ -n "$CONTEXT" ]]; then
+        log_error "Cannot connect to Kubernetes cluster or namespace '$NAMESPACE' does not exist (context: '$CONTEXT')"
+        echo "Error: Cannot connect to Kubernetes cluster or namespace '$NAMESPACE' does not exist"
+        echo "Check if context '$CONTEXT' is valid and accessible"
+    else
+        log_error "Cannot connect to Kubernetes cluster or namespace '$NAMESPACE' does not exist"
+        echo "Error: Cannot connect to Kubernetes cluster or namespace '$NAMESPACE' does not exist"
+    fi
+    exit 1
+fi
+
+# Check if required tools are available
+for tool in lsof cut; do
+    if ! command -v "$tool" &> /dev/null; then
+        log_error "Required tool '$tool' is not installed or not in PATH"
+        echo "Error: Required tool '$tool' is not installed or not in PATH"
+        exit 1
+    fi
+done
+
+# Start all port forwards
+start_all_port_forwards
+
+echo ""
+echo "Monitoring processes (Press Ctrl+C to stop)..."
+echo "Use 'kill -USR1 $$' to show status"
+
+# Set up USR1 signal for status display
+trap show_status USR1
+
+# Main monitoring loop
+while true; do
+    monitor_processes
+    sleep 5
+done
