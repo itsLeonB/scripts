@@ -253,26 +253,21 @@ start_port_forward() {
         return 1
     fi
 
-    # Build kubectl command with optional context
-    local kubectl_cmd="kubectl"
+    # Start port forward in background - simpler approach
     if [[ -n "$CONTEXT" ]]; then
-        kubectl_cmd="$kubectl_cmd --context $CONTEXT"
+        kubectl --context "$CONTEXT" --namespace "$NAMESPACE" port-forward \
+            "${type}/${name}" "${local_port}:${remote_port}" >/dev/null 2>&1 &
+    else
+        kubectl --namespace "$NAMESPACE" port-forward \
+            "${type}/${name}" "${local_port}:${remote_port}" >/dev/null 2>&1 &
     fi
-    kubectl_cmd="$kubectl_cmd --namespace $NAMESPACE"
-
-    # Start port forward and capture stderr
-    local error_output
-    error_output=$($kubectl_cmd port-forward \
-        "${type}/${name}" \
-        "${local_port}:${remote_port}" \
-        > /dev/null 2>&1 &)
 
     local pid=$!
 
     # Wait briefly to check if process started successfully
-    sleep 1
+    sleep 2
     if ! kill -0 "$pid" 2>/dev/null; then
-        log_error "Failed to start port-forwarding for $name: $error_output"
+        log_error "Failed to start port-forwarding for $name (PID was: $pid)"
         echo "Failed to start port-forwarding for $name"
         return 1
     fi
